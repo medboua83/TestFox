@@ -42,7 +42,12 @@ export function isFreeOpenRouterModel(model: OpenRouterCatalogModel): boolean {
         return false;
     }
 
-    return isZeroPrice(model.pricing.prompt)
+    const hasKnownPrice = model.pricing.prompt !== undefined
+        || model.pricing.completion !== undefined
+        || model.pricing.request !== undefined;
+
+    return hasKnownPrice
+        && isZeroPrice(model.pricing.prompt)
         && isZeroPrice(model.pricing.completion)
         && isZeroPrice(model.pricing.request);
 }
@@ -91,7 +96,7 @@ function codeTestingScore(model: OpenRouterAvailableModel): number {
     }
 
     if (model.context_length) {
-        score += Math.min(4, Math.log2(Math.max(1, model.context_length / 32768)));
+        score += Math.max(0, Math.min(4, Math.log2(Math.max(1, model.context_length / 32768))));
     }
 
     return score;
