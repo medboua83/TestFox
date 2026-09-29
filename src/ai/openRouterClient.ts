@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import axios, { AxiosInstance } from 'axios';
+import { mapOpenRouterModel, rankFreeModels, OpenRouterCatalogModel } from './openRouterModelUtils';
 
 export type AIState =
   | 'unconfigured'
@@ -75,6 +76,8 @@ export class OpenRouterClient {
     private model: string;
     private state: AIState = 'unconfigured';
     private output = vscode.window.createOutputChannel('TestFox AI');
+    private modelCache: { models: AvailableModel[]; expiresAt: number } | null = null;
+    private static readonly MODEL_CACHE_TTL_MS = 5 * 60 * 1000;
 
     // Top-tier free models on OpenRouter (prioritized order)
     // Top-tier free models on OpenRouter (prioritized order)
@@ -185,9 +188,28 @@ export class OpenRouterClient {
                 throw new Error(`OpenRouter API returned unexpected status: ${modelsResponse.status}`);
             }
 
-            // Second, test with a minimal chat completion to ensure the key works for generation
+            const discoveredModels = ((modelsResponse.data?.data || []) as OpenRouterCatalogModel[])
+                .filter(model => !!model?.id)
+                .map(mapOpenRouterModel);
+
+            if (discoveredModels.length > 0) {
+                this.modelCache = {
+                    models: discoveredModels,
+                    expiresAt: Date.now() + OpenRouterClient.MODEL_CACHE_TTL_MS
+                };
+            }
+
+            const configuredModel = this.model || config.get<string>('ai.model') || '';
+            const configuredIsAvailable = discoveredModels.some(model => model.id === configuredModel);
+            const validationModel = configuredIsAvailable
+                ? configuredModel
+                : rankFreeModels(discoveredModels)[0]?.id || configuredModel || 'openrouter-auto';
+
+            this.output.appendLine(`TestFox AI: Validating generation with model ${validationModel}`);
+
+            // Test a minimal chat completion using an actually available model.
             const chatResponse = await axios.post(`${baseUrl}/chat/completions`, {
-                model: 'google/gemini-2.0-flash-exp:free',
+                model: validationModel,
                 messages: [
                     {
                         role: 'user',
@@ -269,56 +291,73 @@ export class OpenRouterClient {
 
     async generate(prompt: string): Promise<string> {
         if (!this.apiKey) {
-            // If no API key is configured, generate rule-based test cases
             return this.generateRuleBasedTests(prompt);
         }
 
         const config = vscode.workspace.getConfiguration('testfox');
         const baseUrl = config.get<string>('ai.baseUrl') || 'https://openrouter.ai/api/v1';
-        const model = this.model || config.get<string>('ai.model') || 'google/gemini-2.0-flash-exp:free';
+        const primaryModel = this.model || config.get<string>('ai.model') || 'openrouter-auto';
 
         try {
-            const response = await axios.post<OpenRouterResponse>(
-                `${baseUrl}/chat/completions`,
-                {
-                    model: model,
-                    messages: [
-                        {
-                            role: 'system',
-                            content: 'You are TestFox AI, a professional software testing assistant. Generate comprehensive, accurate test cases based on the provided requirements.'
-                        },
-                        {
-                            role: 'user',
-                            content: prompt
-                        }
-                    ],
-                    max_tokens: 4000,
-                    temperature: 0.7
-                },
-                {
-                    baseURL: baseUrl,
-                    timeout: 120000, // Increased to 120 seconds for better reliability
-                    headers: {
-                        'Authorization': `Bearer ${this.apiKey}`,
-                        'HTTP-Referer': 'https://github.com/testfox/testfox-vscode',
-                        'X-Title': 'TestFox VS Code Extension'
-                    }
-                }
-            );
+            return await this.requestCompletion(prompt, primaryModel, baseUrl);
+        } catch (error: any) {
+            this.output.appendLine(`TestFox AI: Primary model ${primaryModel} failed: ${error.message}`);
 
-            if (response.data?.choices?.[0]?.message?.content) {
-                this.output.appendLine(`TestFox AI: Generated ${response.data.usage?.total_tokens || 0} tokens using ${model}`);
-                return response.data.choices[0].message.content;
+            try {
+                const fallbackModel = await this.selectFallbackModel(primaryModel);
+                if (fallbackModel) {
+                    this.output.appendLine(`TestFox AI: Retrying once with free fallback model ${fallbackModel}`);
+                    return await this.requestCompletion(prompt, fallbackModel, baseUrl);
+                }
+            } catch (fallbackError: any) {
+                this.output.appendLine(`TestFox AI: Fallback discovery/retry failed: ${fallbackError.message}`);
             }
 
-            throw new Error('Invalid response from AI service');
-
-        } catch (error: any) {
-            this.output.appendLine(`TestFox AI: Request failed: ${error.message}`);
-            // Fall back to rule-based test generation on error
             this.output.appendLine('TestFox AI: Falling back to rule-based test generation');
             return this.generateRuleBasedTests(prompt);
         }
+    }
+
+    private async requestCompletion(prompt: string, model: string, baseUrl: string): Promise<string> {
+        const response = await axios.post<OpenRouterResponse>(
+            `${baseUrl}/chat/completions`,
+            {
+                model,
+                messages: [
+                    {
+                        role: 'system',
+                        content: 'You are TestFox AI, a professional software testing assistant. Generate comprehensive, accurate test cases based on the provided requirements.'
+                    },
+                    {
+                        role: 'user',
+                        content: prompt
+                    }
+                ],
+                max_tokens: 4000,
+                temperature: 0.7
+            },
+            {
+                timeout: 120000,
+                headers: {
+                    'Authorization': `Bearer ${this.apiKey}`,
+                    'HTTP-Referer': 'https://github.com/testfox/testfox-vscode',
+                    'X-Title': 'TestFox VS Code Extension'
+                }
+            }
+        );
+
+        const content = response.data?.choices?.[0]?.message?.content;
+        if (!content) {
+            throw new Error('Invalid response from AI service');
+        }
+
+        this.output.appendLine(`TestFox AI: Generated ${response.data.usage?.total_tokens || 0} tokens using ${model}`);
+        return content;
+    }
+
+    private async selectFallbackModel(excludedModelId: string): Promise<string | undefined> {
+        const models = await this.getAvailableModels();
+        return rankFreeModels(models, excludedModelId)[0]?.id;
     }
 
     /* ------------------ RULE-BASED FALLBACK ------------------ */
@@ -543,7 +582,8 @@ Consider configuring AI API keys for more comprehensive and context-aware test c
                     JSON.stringify(err.response.data).includes('model_not_found')
                 )) {
                     this.output.appendLine(`TestFox AI: Model ${model} does not exist, using fallback...`);
-                    this.model = 'google/gemini-2.0-flash-exp:free'; // Fallback to known good model
+                    const fallback = await this.selectFallbackModel(model);
+                    this.model = fallback || model;
                 } else {
                     this.output.appendLine(`TestFox AI: Model validation failed: ${err.message}`);
                     this.model = model; // Set anyway, might be a network issue
@@ -612,25 +652,56 @@ Consider configuring AI API keys for more comprehensive and context-aware test c
      * Get available models (legacy compatibility)
      */
     async getAvailableModels(): Promise<AvailableModel[]> {
-        // Return a curated list of working models
-        const models: AvailableModel[] = OpenRouterClient.FREE_MODELS.map(id => ({
+        const now = Date.now();
+        if (this.modelCache && this.modelCache.expiresAt > now) {
+            return this.modelCache.models;
+        }
+
+        try {
+            const config = vscode.workspace.getConfiguration('testfox');
+            const baseUrl = config.get<string>('ai.baseUrl') || 'https://openrouter.ai/api/v1';
+            const response = await axios.get<{ data?: OpenRouterCatalogModel[] }>(`${baseUrl}/models`, {
+                timeout: 10000,
+                headers: {
+                    ...(this.apiKey ? { 'Authorization': `Bearer ${this.apiKey}` } : {}),
+                    'HTTP-Referer': 'https://github.com/testfox/testfox-vscode',
+                    'X-Title': 'TestFox VS Code Extension'
+                }
+            });
+
+            const discovered = (response.data?.data || [])
+                .filter(model => !!model?.id)
+                .map(mapOpenRouterModel);
+
+            if (discovered.length > 0) {
+                this.modelCache = {
+                    models: discovered,
+                    expiresAt: now + OpenRouterClient.MODEL_CACHE_TTL_MS
+                };
+                this.output.appendLine(`TestFox AI: Discovered ${discovered.length} OpenRouter models`);
+                return discovered;
+            }
+        } catch (error: any) {
+            this.output.appendLine(`TestFox AI: Dynamic model discovery failed: ${error.message}`);
+        }
+
+        const curated: AvailableModel[] = OpenRouterClient.FREE_MODELS.map(id => ({
             id,
             name: id.split('/').pop()?.replace(':free', '') || id,
             isFree: true,
             isWorking: true
         }));
-        
-        // Add premium models
+
         OpenRouterClient.PREMIUM_MODELS.forEach(id => {
-            models.push({
+            curated.push({
                 id,
                 name: id.split('/').pop() || id,
                 isFree: false,
                 isWorking: true
             });
         });
-        
-        return models;
+
+        return curated;
     }
 
     /**
