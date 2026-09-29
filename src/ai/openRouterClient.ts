@@ -188,9 +188,28 @@ export class OpenRouterClient {
                 throw new Error(`OpenRouter API returned unexpected status: ${modelsResponse.status}`);
             }
 
-            // Second, test with a minimal chat completion to ensure the key works for generation
+            const discoveredModels = ((modelsResponse.data?.data || []) as OpenRouterCatalogModel[])
+                .filter(model => !!model?.id)
+                .map(mapOpenRouterModel);
+
+            if (discoveredModels.length > 0) {
+                this.modelCache = {
+                    models: discoveredModels,
+                    expiresAt: Date.now() + OpenRouterClient.MODEL_CACHE_TTL_MS
+                };
+            }
+
+            const configuredModel = this.model || config.get<string>('ai.model') || '';
+            const configuredIsAvailable = discoveredModels.some(model => model.id === configuredModel);
+            const validationModel = configuredIsAvailable
+                ? configuredModel
+                : rankFreeModels(discoveredModels)[0]?.id || configuredModel || 'openrouter-auto';
+
+            this.output.appendLine(`TestFox AI: Validating generation with model ${validationModel}`);
+
+            // Test a minimal chat completion using an actually available model.
             const chatResponse = await axios.post(`${baseUrl}/chat/completions`, {
-                model: 'google/gemini-2.0-flash-exp:free',
+                model: validationModel,
                 messages: [
                     {
                         role: 'user',
